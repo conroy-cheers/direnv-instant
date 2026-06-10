@@ -16,6 +16,7 @@ rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [
       ./Cargo.toml
       ./Cargo.lock
+      ./crates
       ./src
       ./hooks
       ./tests
