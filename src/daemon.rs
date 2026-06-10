@@ -6,7 +6,9 @@ use nix::sys::signal::{Signal, kill};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use nix::sys::time::{TimeVal, TimeValLike};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, read, setsid};
+use nix::unistd::{
+    ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, read, setsid, ttyname,
+};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsString;
 use std::fs::{File, remove_file};
@@ -80,10 +82,17 @@ pub struct DaemonContext {
     pub temp_stderr: PathBuf,
     pub multiplexer: Option<Multiplexer>,
     pub shell: Shell,
+    pub tty_path: Option<PathBuf>,
+    pub project_name: String,
 }
 
 impl DaemonContext {
     pub fn new(parent_pid: i32, envrc_dir: PathBuf, shell: Shell) -> std::io::Result<Self> {
+        let project_name = envrc_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
         let runtime_dir = get_runtime_dir(&envrc_dir);
 
         // Create runtime directory if it doesn't exist (needed for mkstemp)
@@ -93,6 +102,15 @@ impl DaemonContext {
 
         let temp_file = create_temp_file(&runtime_dir, "env")?;
         let temp_stderr = create_temp_file(&runtime_dir, "env_stderr")?;
+        let tty_path = env::var("DIRENV_INSTANT_TTY")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| {
+                ttyname(std::io::stderr())
+                    .or_else(|_| ttyname(std::io::stdin()))
+                    .ok()
+            });
 
         Ok(Self {
             parent_pid,
@@ -103,6 +121,8 @@ impl DaemonContext {
             temp_stderr,
             multiplexer: Multiplexer::detect(),
             shell,
+            tty_path,
+            project_name,
         })
     }
 }

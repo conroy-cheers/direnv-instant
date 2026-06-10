@@ -18,6 +18,7 @@ pub enum Multiplexer {
     Zellij,
     Wezterm,
     Kitty,
+    Inline,
 }
 
 impl Multiplexer {
@@ -38,6 +39,10 @@ impl Multiplexer {
             return Some(Self::Kitty);
         }
 
+        if env::var("DIRENV_INSTANT_INLINE_VIEWER").is_ok_and(|v| v != "0") {
+            return Some(Self::Inline);
+        }
+
         None
     }
 
@@ -48,11 +53,36 @@ impl Multiplexer {
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "direnv-instant".to_string());
 
+        if *self == Multiplexer::Inline {
+            let tty_path = ctx
+                .tty_path
+                .as_deref()
+                .ok_or_else(|| Error::other("no TTY path for inline viewer"))?;
+            return Command::new(&bin)
+                .env("DIRENV_INSTANT_INTERNAL_INLINE_VIEWER", "1")
+                .env(
+                    "DIRENV_INSTANT_INTERNAL_LOG_PATH",
+                    ctx.temp_stderr.to_string_lossy().as_ref(),
+                )
+                .env(
+                    "DIRENV_INSTANT_INTERNAL_SOCKET_PATH",
+                    ctx.socket_path.to_string_lossy().as_ref(),
+                )
+                .env(
+                    "DIRENV_INSTANT_INTERNAL_TTY_PATH",
+                    tty_path.to_string_lossy().as_ref(),
+                )
+                .env("DIRENV_INSTANT_INTERNAL_PROJECT_NAME", &ctx.project_name)
+                .spawn()
+                .map(|_| ());
+        }
+
         let mux_bin = match self {
             Multiplexer::Tmux => "tmux",
             Multiplexer::Zellij => "zellij",
             Multiplexer::Wezterm => "wezterm",
             Multiplexer::Kitty => "kitty",
+            Multiplexer::Inline => unreachable!(),
         };
 
         let mut command = Command::new(mux_bin);
@@ -82,6 +112,7 @@ impl Multiplexer {
                 command.args(["@", "--to", kitty_listen_on.as_str()]);
                 command.arg("launch").args(kitty_launch_args());
             }
+            Multiplexer::Inline => unreachable!(),
         }
 
         command
