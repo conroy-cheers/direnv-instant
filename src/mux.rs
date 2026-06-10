@@ -1,6 +1,6 @@
 use std::{
     env,
-    io::{self, Error},
+    io::{self, Error, IsTerminal},
     process::Command,
 };
 
@@ -9,6 +9,7 @@ use crate::daemon::DaemonContext;
 const PANE_HEIGHT: &str = "10";
 const KITTY_VAR: &str = "KITTY_LISTEN_ON";
 const KITTY_LAUNCH_ARGS_VAR: &str = "DIRENV_INSTANT_KITTY_LAUNCH_ARGS";
+const INLINE_VIEWER_VAR: &str = "DIRENV_INSTANT_INLINE_VIEWER";
 const DEFAULT_KITTY_LAUNCH_ARGS: [&str; 4] = ["--location", "vsplit", "--keep-focus", "--self"];
 
 #[non_exhaustive]
@@ -39,7 +40,11 @@ impl Multiplexer {
             return Some(Self::Kitty);
         }
 
-        if env::var("DIRENV_INSTANT_INLINE_VIEWER").is_ok_and(|v| v != "0") {
+        if env::var(INLINE_VIEWER_VAR).is_ok_and(|v| v != "0") {
+            return Some(Self::Inline);
+        }
+
+        if env::var(INLINE_VIEWER_VAR).is_err() && terminal_supports_inline_viewer() {
             return Some(Self::Inline);
         }
 
@@ -47,7 +52,6 @@ impl Multiplexer {
     }
 
     pub fn spawn(&self, ctx: &DaemonContext) -> io::Result<()> {
-        // Use full path to binary so the multiplexer can find it
         let bin = env::current_exe()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
@@ -72,7 +76,6 @@ impl Multiplexer {
                     "DIRENV_INSTANT_INTERNAL_TTY_PATH",
                     tty_path.to_string_lossy().as_ref(),
                 )
-                .env("DIRENV_INSTANT_INTERNAL_PROJECT_NAME", &ctx.project_name)
                 .spawn()
                 .map(|_| ());
         }
@@ -125,6 +128,14 @@ impl Multiplexer {
             .spawn()
             .map(|_| ())
     }
+}
+
+fn terminal_supports_inline_viewer() -> bool {
+    let Ok(term) = env::var("TERM") else {
+        return false;
+    };
+
+    !term.is_empty() && term != "dumb" && (io::stderr().is_terminal() || io::stdin().is_terminal())
 }
 
 fn kitty_launch_args() -> Vec<String> {

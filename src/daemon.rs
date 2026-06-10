@@ -83,16 +83,15 @@ pub struct DaemonContext {
     pub multiplexer: Option<Multiplexer>,
     pub shell: Shell,
     pub tty_path: Option<PathBuf>,
-    pub project_name: String,
 }
 
 impl DaemonContext {
+    pub fn cleanup_temp_files(&self) {
+        let _ = remove_file(&self.temp_file);
+        let _ = remove_file(&self.temp_stderr);
+    }
+
     pub fn new(parent_pid: i32, envrc_dir: PathBuf, shell: Shell) -> std::io::Result<Self> {
-        let project_name = envrc_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
         let runtime_dir = get_runtime_dir(&envrc_dir);
 
         // Create runtime directory if it doesn't exist (needed for mkstemp)
@@ -102,6 +101,7 @@ impl DaemonContext {
 
         let temp_file = create_temp_file(&runtime_dir, "env")?;
         let temp_stderr = create_temp_file(&runtime_dir, "env_stderr")?;
+
         let tty_path = env::var("DIRENV_INSTANT_TTY")
             .ok()
             .map(PathBuf::from)
@@ -122,7 +122,6 @@ impl DaemonContext {
             multiplexer: Multiplexer::detect(),
             shell,
             tty_path,
-            project_name,
         })
     }
 }
@@ -132,9 +131,7 @@ impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         let ctx = self.0;
         let _ = remove_file(&ctx.socket_path);
-        // Clean up temp files if they weren't renamed
-        let _ = remove_file(&ctx.temp_file);
-        let _ = remove_file(&ctx.temp_stderr);
+        ctx.cleanup_temp_files();
     }
 }
 
@@ -151,12 +148,11 @@ pub fn stop_daemon(socket_path: &Path) {
 }
 
 pub fn start_daemon(direnv_cmd: &str, ctx: &DaemonContext) {
-    // Check if daemon already running
     if ctx.socket_path.exists() {
         if UnixStream::connect(&ctx.socket_path).is_ok() {
-            return; // Already running
+            return;
         }
-        let _ = remove_file(&ctx.socket_path); // Stale socket
+        let _ = remove_file(&ctx.socket_path);
     }
 
     match unsafe { fork() } {
@@ -169,7 +165,6 @@ pub fn start_daemon(direnv_cmd: &str, ctx: &DaemonContext) {
             match unsafe { fork() } {
                 Ok(ForkResult::Parent { .. }) => std::process::exit(0),
                 Ok(ForkResult::Child) => {
-                    // Redirect stdin, stdout, stderr to detach from parent
                     let devnull = File::open("/dev/null").expect("Failed to open /dev/null");
                     dup2_stdin(&devnull).expect("Failed to redirect stdin");
 
@@ -312,12 +307,17 @@ fn child_process(direnv_cmd: &str, temp_file: &Path, shell: Shell) -> ! {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+struct PtyLoopResult {
+    completed: bool,
+    mux_spawned: bool,
+}
+
 fn copy_pty_to_logfile(
     master: &OwnedFd,
     log_file: &mut File,
     should_stop: &Arc<AtomicBool>,
     ctx: &DaemonContext,
-) -> bool {
+) -> PtyLoopResult {
     use std::time::Instant;
 
     let mux_delay_ms = mux::mux_delay_ms();
@@ -329,7 +329,10 @@ fn copy_pty_to_logfile(
 
     loop {
         if should_stop.load(Ordering::Relaxed) {
-            return false;
+            return PtyLoopResult {
+                completed: false,
+                mux_spawned,
+            };
         }
 
         let mut fds = FdSet::new();
@@ -338,7 +341,12 @@ fn copy_pty_to_logfile(
 
         match select(None, Some(&mut fds), None, None, Some(&mut timeout)) {
             Ok(_) if fds.contains(master.as_fd()) => match read(master, &mut buf) {
-                Ok(0) | Err(Errno::EIO) => return true,
+                Ok(0) | Err(Errno::EIO) => {
+                    return PtyLoopResult {
+                        completed: true,
+                        mux_spawned,
+                    };
+                }
                 Ok(n) => {
                     total_bytes += n;
                     let _ = log_file.write_all(&buf[..n]);
@@ -346,12 +354,18 @@ fn copy_pty_to_logfile(
                 }
                 Err(e) => {
                     eprintln!("direnv-instant: PTY read error: {}", e);
-                    return true;
+                    return PtyLoopResult {
+                        completed: true,
+                        mux_spawned,
+                    };
                 }
             },
             Err(e) => {
                 eprintln!("direnv-instant: PTY select error: {}", e);
-                return true;
+                return PtyLoopResult {
+                    completed: true,
+                    mux_spawned,
+                };
             }
             _ => {
                 // Timeout elapsed, check if we should spawn the multiplexer
@@ -391,8 +405,8 @@ fn parent_process(
         }
     };
 
-    let completed = copy_pty_to_logfile(&master, &mut log_file, &should_stop, ctx);
-    if !completed {
+    let result = copy_pty_to_logfile(&master, &mut log_file, &should_stop, ctx);
+    if !result.completed {
         let _ = kill(child, Signal::SIGTERM);
         return;
     }
@@ -402,19 +416,19 @@ fn parent_process(
         Ok(WaitStatus::Exited(_, 0))
     );
 
-    // Check if stderr file has actual content (not just empty file we created)
     let has_stderr = ctx
         .temp_stderr
         .metadata()
         .map(|m| m.len() > 0)
         .unwrap_or(false);
 
+    let inline_mode = ctx.multiplexer == Some(Multiplexer::Inline);
     if has_stderr {
-        let _ = std::fs::rename(&ctx.temp_stderr, &ctx.stderr_file);
+        if !inline_mode && !result.mux_spawned {
+            let _ = std::fs::rename(&ctx.temp_stderr, &ctx.stderr_file);
+        }
     }
-    // Otherwise Cleanup Drop will remove it
 
-    // Only rename env file on success and if it has content
     let has_env = success
         && ctx
             .temp_file
@@ -426,8 +440,12 @@ fn parent_process(
     }
     // Otherwise Cleanup Drop will remove it
 
-    // Notify shells if we have anything to show
-    if has_stderr || has_env {
+    let notify_shells = if inline_mode {
+        has_env
+    } else {
+        has_stderr || has_env
+    };
+    if notify_shells {
         for pid in notify_pids.lock().expect("Failed to lock").iter() {
             let _ = kill(Pid::from_raw(*pid), Signal::SIGUSR1);
         }

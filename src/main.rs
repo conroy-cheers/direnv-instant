@@ -15,12 +15,10 @@ fn main() {
             .expect("DIRENV_INSTANT_INTERNAL_SOCKET_PATH is required");
         let tty_path = env::var_os("DIRENV_INSTANT_INTERNAL_TTY_PATH")
             .expect("DIRENV_INSTANT_INTERNAL_TTY_PATH is required");
-        let project_name = env::var("DIRENV_INSTANT_INTERNAL_PROJECT_NAME").ok();
         commands::watch_inline::run(
             Path::new(&log_path),
             Path::new(&socket_path),
             Path::new(&tty_path),
-            project_name.as_deref(),
         );
         return;
     }

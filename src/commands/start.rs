@@ -34,7 +34,6 @@ pub fn run() {
         }
     };
 
-    // Check if we need to restart daemon (different directory)
     if let Ok(current) = env::var("__DIRENV_INSTANT_CURRENT_DIR") {
         let current_dir = PathBuf::from(&current);
         if current_dir != envrc_dir {
@@ -46,13 +45,11 @@ pub fn run() {
         &envrc_dir.display().to_string(),
     );
 
-    // If not in a multiplexer, just run direnv synchronously
     if Multiplexer::detect().is_none() {
         run_direnv_sync(direnv, shell, true);
         return;
     }
 
-    // Set up daemon context
     let ctx = match DaemonContext::new(parent_pid, envrc_dir, shell) {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -70,8 +67,8 @@ pub fn run() {
         &ctx.stderr_file.display().to_string(),
     );
 
-    // Check if daemon is already running
     if ctx.socket_path.exists() && notify_daemon(&ctx.socket_path, parent_pid) {
+        ctx.cleanup_temp_files();
         return;
     }
 
