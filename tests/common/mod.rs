@@ -13,12 +13,19 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::io::Read;
+use std::io::{BufRead, BufReader, IoSlice, Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
+
+use nix::pty::openpty;
+use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 
 /// Path to the binary under test.
 ///
@@ -196,6 +203,8 @@ pub struct TmuxServer {
     pub socket: PathBuf,
 }
 
+static TMUX_SERVER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl TmuxServer {
     /// Start with a default-sized session.
     pub fn new(dir: &Path) -> io::Result<Self> {
@@ -214,6 +223,44 @@ impl TmuxServer {
         assert!(
             out.status.success(),
             "tmux new-session failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(Self { socket })
+    }
+
+    /// Start with the stripped-down tmux config used by terminal-backend
+    /// parity tests.
+    pub fn with_parity_config(dir: &Path, size: (u32, u32)) -> io::Result<Self> {
+        let n = TMUX_SERVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let socket = dir.join(format!("tmux-parity-{}-{n}", std::process::id()));
+        let conf =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-parity.tmux.conf");
+        let command = "sleep 3600";
+        let out = Command::new("tmux")
+            .args(["-f", conf.to_str().unwrap()])
+            .args(["-S", socket.to_str().unwrap()])
+            .args([
+                "new-session",
+                "-d",
+                "-x",
+                &size.0.to_string(),
+                "-y",
+                &size.1.to_string(),
+            ])
+            .args(["-c", dir.to_str().unwrap(), command])
+            .output()?;
+        assert!(
+            out.status.success(),
+            "tmux parity new-session failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = Command::new("tmux")
+            .args(["-S", socket.to_str().unwrap()])
+            .args(["set-option", "-g", "window-size", "manual"])
+            .output()?;
+        assert!(
+            out.status.success(),
+            "tmux parity set window-size failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         Ok(Self { socket })
@@ -254,6 +301,102 @@ impl TmuxServer {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+
+    pub fn pane_tty(&self) -> io::Result<PathBuf> {
+        let out = self.cmd(&["display-message", "-p", "#{pane_tty}"])?;
+        assert!(
+            out.status.success(),
+            "tmux display-message failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
+    }
+
+    pub fn resize_window(&self, cols: u32, rows: u32) -> io::Result<()> {
+        let out = self.cmd(&[
+            "resize-window",
+            "-x",
+            &cols.to_string(),
+            "-y",
+            &rows.to_string(),
+        ])?;
+        assert!(
+            out.status.success(),
+            "tmux resize-window failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    }
+
+    pub fn capture_window_grid(&self, cols: usize, rows: usize) -> io::Result<Vec<String>> {
+        let mut grid = vec![vec![' '; cols]; rows];
+        let mut pane_cells = vec![vec![false; cols]; rows];
+        let panes = self.cmd(&[
+            "list-panes",
+            "-F",
+            "#{pane_id}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}",
+        ])?;
+        assert!(
+            panes.status.success(),
+            "tmux list-panes failed: {}",
+            String::from_utf8_lossy(&panes.stderr)
+        );
+
+        for line in String::from_utf8_lossy(&panes.stdout).lines() {
+            let fields: Vec<&str> = line.split('|').collect();
+            assert_eq!(fields.len(), 5, "unexpected list-panes row: {line}");
+            let pane_id = fields[0];
+            let left: usize = fields[1].parse().unwrap();
+            let top: usize = fields[2].parse().unwrap();
+            let width: usize = fields[3].parse().unwrap();
+            let height: usize = fields[4].parse().unwrap();
+
+            let capture = self.cmd(&["capture-pane", "-p", "-t", pane_id, "-S", "0", "-E", "-"])?;
+            assert!(
+                capture.status.success(),
+                "tmux capture-pane failed: {}",
+                String::from_utf8_lossy(&capture.stderr)
+            );
+
+            for (dy, captured) in String::from_utf8_lossy(&capture.stdout)
+                .lines()
+                .take(height)
+                .enumerate()
+            {
+                let row = top + dy;
+                if row >= rows {
+                    continue;
+                }
+                for col in left..(left + width).min(cols) {
+                    pane_cells[row][col] = true;
+                }
+                for (dx, ch) in captured.chars().take(width).enumerate() {
+                    let col = left + dx;
+                    if col < cols {
+                        grid[row][col] = ch;
+                    }
+                }
+            }
+        }
+
+        let pane_rows: Vec<bool> = pane_cells
+            .iter()
+            .map(|row| row.iter().any(|&cell| cell))
+            .collect();
+        for row in 1..rows.saturating_sub(1) {
+            if !pane_rows[row]
+                && pane_rows[..row].iter().any(|&seen| seen)
+                && pane_rows[row + 1..].iter().any(|&seen| seen)
+            {
+                grid[row].fill('─');
+            }
+        }
+
+        Ok(grid
+            .into_iter()
+            .map(|row| row.into_iter().collect::<String>())
+            .collect())
+    }
 }
 
 impl Drop for TmuxServer {
@@ -261,6 +404,165 @@ impl Drop for TmuxServer {
         let _ = Command::new("tmux")
             .args(["-S", self.socket.to_str().unwrap(), "kill-server"])
             .output();
+    }
+}
+
+pub struct FakeDaemon {
+    pub log_path: PathBuf,
+    pub socket_path: PathBuf,
+    monitors: Arc<Mutex<Vec<UnixStream>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+    pty_slave: Option<OwnedFd>,
+}
+
+impl FakeDaemon {
+    pub fn start(dir: &Path, with_pty: bool) -> io::Result<Self> {
+        let log_path = dir.join("daemon.log");
+        let socket_path = dir.join("daemon.sock");
+        fs::write(&log_path, "")?;
+        let _ = fs::remove_file(&socket_path);
+
+        let listener = UnixListener::bind(&socket_path)?;
+        listener.set_nonblocking(true)?;
+        let monitors = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_monitors = monitors.clone();
+        let thread_stop = stop.clone();
+        let pty = if with_pty {
+            Some(openpty(None, None).unwrap())
+        } else {
+            None
+        };
+        let pty_master = pty.as_ref().map(|p| p.master.try_clone().unwrap());
+        let pty_slave = pty.map(|p| p.slave);
+
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        handle_daemon_connection(stream, &thread_monitors, pty_master.as_ref());
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(Self {
+            log_path,
+            socket_path,
+            monitors,
+            stop,
+            thread: Some(thread),
+            pty_slave,
+        })
+    }
+
+    pub fn append_log(&self, data: &str) -> io::Result<()> {
+        let mut f = fs::OpenOptions::new().append(true).open(&self.log_path)?;
+        f.write_all(data.as_bytes())?;
+        f.flush()
+    }
+
+    pub fn wait_for_monitor(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.monitors.lock().unwrap().is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn finish(&self, status: i32) {
+        let _ = fs::write(
+            self.socket_path.with_file_name("exit_status"),
+            status.to_string(),
+        );
+        self.monitors.lock().unwrap().clear();
+    }
+
+    pub fn read_pty_until(&self, needle: &str, timeout: Duration) -> String {
+        let Some(slave) = &self.pty_slave else {
+            return String::new();
+        };
+        set_nonblocking(slave);
+        let deadline = Instant::now() + timeout;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match nix::unistd::read(slave, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    out.extend_from_slice(&buf[..n]);
+                    if String::from_utf8_lossy(&out).contains(needle) {
+                        break;
+                    }
+                }
+                Err(nix::errno::Errno::EAGAIN) => thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+impl Drop for FakeDaemon {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.monitors.lock().unwrap().clear();
+        let _ = fs::remove_file(&self.socket_path);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn handle_daemon_connection(
+    stream: UnixStream,
+    monitors: &Arc<Mutex<Vec<UnixStream>>>,
+    pty_master: Option<&OwnedFd>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(n) if n > 0 && line.starts_with("WATCH") => send_watch_response(&stream, pty_master),
+        Ok(n) if n > 0 && line.starts_with("STOP") => {}
+        _ => monitors.lock().unwrap().push(stream),
+    }
+}
+
+fn send_watch_response(stream: &UnixStream, pty_master: Option<&OwnedFd>) {
+    if let Some(master) = pty_master {
+        let fds = [master.as_raw_fd()];
+        let cmsg = [ControlMessage::ScmRights(&fds)];
+        sendmsg::<()>(
+            stream.as_raw_fd(),
+            &[IoSlice::new(b"OK\n")],
+            &cmsg,
+            MsgFlags::empty(),
+            None,
+        )
+        .unwrap();
+    } else {
+        sendmsg::<()>(
+            stream.as_raw_fd(),
+            &[IoSlice::new(b"ERR\n")],
+            &[],
+            MsgFlags::empty(),
+            None,
+        )
+        .unwrap();
     }
 }
 
